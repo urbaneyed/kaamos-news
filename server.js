@@ -1,4 +1,9 @@
+const path = require('path');
+// Load .env from current dir, or fallback to parent dir (survives git deploys on Hostinger)
 require('dotenv').config();
+if (!process.env.DB_USER) {
+  require('dotenv').config({ path: path.resolve(__dirname, '..', '.env.crawl') });
+}
 const express = require('express');
 const mysql = require('mysql2/promise');
 const RSSParser = require('rss-parser');
