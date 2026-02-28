@@ -443,8 +443,8 @@ app.post('/api/fetch', authMiddleware, async (req, res) => {
 
     cache.set('source_count', sources.length);
 
-    // Process sources in parallel (batches of 5)
-    const batchSize = 5;
+    // Process sources in small batches (2 at a time to be gentle on shared hosting)
+    const batchSize = 2;
     let totalInserted = 0;
     let totalSkipped = 0;
     let totalEnriched = 0;
@@ -457,6 +457,11 @@ app.post('/api/fetch', authMiddleware, async (req, res) => {
           fetchAndProcessSource(db, tenantId, src, { enrichAI, extractImages })
         )
       );
+
+      // Small delay between batches to avoid overwhelming shared hosting
+      if (i + batchSize < sources.length) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
 
       for (let j = 0; j < results.length; j++) {
         const r = results[j];
@@ -807,25 +812,22 @@ async function scheduledFetch() {
       );
 
       let totalInserted = 0;
-      const batchSize = 5;
 
-      for (let i = 0; i < sources.length; i += batchSize) {
-        const batch = sources.slice(i, i + batchSize);
-        const results = await Promise.all(
-          batch.map((src) =>
-            fetchAndProcessSource(db, tenant_id, src, {
-              enrichAI: !!process.env.OPENAI_API_KEY,
-              extractImages: true,
-            })
-          )
-        );
-
-        for (let j = 0; j < results.length; j++) {
-          totalInserted += results[j].inserted;
-          await db.query('UPDATE news_sources SET last_fetched_at = NOW() WHERE id = ?', [
-            batch[j].id,
-          ]);
+      // Sequential processing — one source at a time to be gentle on shared hosting
+      for (const src of sources) {
+        try {
+          const result = await fetchAndProcessSource(db, tenant_id, src, {
+            enrichAI: !!process.env.OPENAI_API_KEY,
+            extractImages: false, // Skip og:image in scheduled runs to reduce outbound requests
+          });
+          totalInserted += result.inserted;
+          await db.query('UPDATE news_sources SET last_fetched_at = NOW() WHERE id = ?', [src.id]);
+        } catch (err) {
+          console.error(`[Scheduler] Source ${src.name} error:`, err.message);
         }
+
+        // 2 second delay between sources
+        await new Promise((r) => setTimeout(r, 2000));
       }
 
       console.log(
@@ -845,13 +847,13 @@ app.listen(PORT, () => {
   console.log(`KaamOS News Service running on port ${PORT}`);
   console.log(`Fetch interval: ${FETCH_INTERVAL / 60000} minutes`);
 
-  // Start scheduled fetching
+  // Scheduled fetching — no auto-fetch on startup (use POST /api/fetch to trigger manually)
+  // Scheduled interval starts after 5 minutes to let server stabilize
   if (FETCH_INTERVAL > 0) {
-    // Initial fetch after 30 seconds (let server stabilize)
     setTimeout(() => {
-      scheduledFetch();
       fetchTimer = setInterval(scheduledFetch, FETCH_INTERVAL);
-    }, 30000);
+      console.log(`[Scheduler] Auto-fetch enabled every ${FETCH_INTERVAL / 60000} minutes`);
+    }, 300000);
   }
 });
 
