@@ -200,6 +200,40 @@ function scoreArticle(article, sourceName) {
 }
 
 // ──────────────────────────────────────────────
+//  Content quality filters
+// ──────────────────────────────────────────────
+
+// Detect non-English articles (Hindi Devanagari, etc.)
+function isNonEnglish(title) {
+  // Devanagari Unicode range: \u0900-\u097F (Hindi, Marathi, Sanskrit)
+  // Also check for Arabic, Chinese, Japanese, Korean
+  return /[\u0900-\u097F\u0600-\u06FF\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]/.test(title);
+}
+
+// Detect low-quality shopping/deals/clickbait articles
+const JUNK_PATTERNS = [
+  /\bavailable\b.{0,15}\b(lowest|best)\s*price/i,
+  /\bavailable\b.{0,10}\bunder\s*rs/i,
+  /\bbest\s*(deals|offers|discounts)\b/i,
+  /\bbuy\s*(now|online|at)\b/i,
+  /\bprice\s*(drop|cut|slash)/i,
+  /\b(grab|snag|score)\s*(this|these|great)\s*(deal|offer)/i,
+  /\bflat\s*\d+%?\s*off\b/i,
+  /\bcoupon\s*code\b/i,
+  /\bunder\s*rs\s*\d/i,
+  /\bbiggest\s*sale\b/i,
+  /\bamazon\s*(sale|deal|offer|prime\s*day)/i,
+  /\bflipkart\s*(sale|deal|offer)/i,
+  /\bworth\s*buying\b/i,
+  /\b(top|best)\s*\d+\s*(smartphones?|laptops?|gadgets?|products?)\s*(under|below|for)\b/i,
+  /\b(cheapest|budget)\s*(phone|smartphone|laptop)/i,
+];
+
+function isJunkContent(title) {
+  return JUNK_PATTERNS.some((pattern) => pattern.test(title));
+}
+
+// ──────────────────────────────────────────────
 //  RSS Feed Fetching
 // ──────────────────────────────────────────────
 
@@ -249,6 +283,18 @@ async function fetchAndProcessSource(db, tenantId, source, options = {}) {
     const url = (item.link || '').trim();
     const title = (item.title || '').trim();
     if (!url || !title) {
+      results.skipped++;
+      continue;
+    }
+
+    // Language filter — skip non-English articles
+    if (isNonEnglish(title)) {
+      results.skipped++;
+      continue;
+    }
+
+    // Quality filter — skip shopping/deals junk
+    if (isJunkContent(title)) {
       results.skipped++;
       continue;
     }
@@ -345,12 +391,11 @@ async function fetchAndProcessSource(db, tenantId, source, options = {}) {
 // ──────────────────────────────────────────────
 
 async function enrichExistingArticles(db, tenantId, limit = 20) {
-  const batchSize = parseInt(process.env.ENRICH_BATCH_SIZE || '10');
   const delay = parseInt(process.env.ENRICH_DELAY_MS || '500');
 
   // Articles from last 3 days without ai_lead
   const [rows] = await db.query(
-    `SELECT id, title, summary, url, image_url
+    `SELECT id, title, summary, url, image_url, source_name, published_at, score
      FROM news_items
      WHERE tenant_id = ? AND ai_lead IS NULL
        AND published_at > DATE_SUB(NOW(), INTERVAL 3 DAY)
@@ -361,6 +406,7 @@ async function enrichExistingArticles(db, tenantId, limit = 20) {
 
   let enriched = 0;
   let imagesAdded = 0;
+  let scored = 0;
 
   for (const row of rows) {
     const updates = {};
@@ -381,6 +427,16 @@ async function enrichExistingArticles(db, tenantId, limit = 20) {
       }
     }
 
+    // Score if missing
+    if (!row.score) {
+      const artScore = scoreArticle(
+        { title: row.title, summary: row.summary, imageUrl: row.image_url || updates.image_url, publishedAt: row.published_at },
+        row.source_name
+      );
+      updates.score = artScore;
+      scored++;
+    }
+
     if (Object.keys(updates).length > 0) {
       const setClauses = Object.keys(updates)
         .map((k) => `${k} = ?`)
@@ -395,7 +451,31 @@ async function enrichExistingArticles(db, tenantId, limit = 20) {
     await new Promise((r) => setTimeout(r, delay));
   }
 
-  return { total: rows.length, enriched, imagesAdded };
+  return { total: rows.length, enriched, imagesAdded, scored };
+}
+
+// Score-only backfill for articles that have no score
+async function scoreExistingArticles(db, tenantId, limit = 100) {
+  const [rows] = await db.query(
+    `SELECT id, title, summary, image_url, source_name, published_at
+     FROM news_items
+     WHERE tenant_id = ? AND (score IS NULL OR score = 0)
+     ORDER BY published_at DESC
+     LIMIT ?`,
+    [tenantId, limit]
+  );
+
+  let scored = 0;
+  for (const row of rows) {
+    const artScore = scoreArticle(
+      { title: row.title, summary: row.summary, imageUrl: row.image_url, publishedAt: row.published_at },
+      row.source_name
+    );
+    await db.query('UPDATE news_items SET score = ? WHERE id = ?', [artScore, row.id]);
+    scored++;
+  }
+
+  return { total: rows.length, scored };
 }
 
 // ──────────────────────────────────────────────
@@ -756,6 +836,88 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
     );
 
     res.json({ total, today, with_ai, with_image, sources });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Score existing unscored articles ──
+app.post('/api/score', authMiddleware, async (req, res) => {
+  const tenantId = parseInt(req.body.tenant_id || '1');
+  const limit = parseInt(req.body.limit || '200');
+
+  try {
+    const db = getPool();
+    const result = await scoreExistingArticles(db, tenantId, limit);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Cleanup junk articles (Hindi, shopping, duplicates) ──
+app.post('/api/cleanup', authMiddleware, async (req, res) => {
+  const tenantId = parseInt(req.body.tenant_id || '1');
+
+  try {
+    const db = getPool();
+
+    // Delete Hindi/non-English articles
+    const [allItems] = await db.query(
+      'SELECT id, title FROM news_items WHERE tenant_id = ?',
+      [tenantId]
+    );
+
+    let deletedNonEnglish = 0;
+    let deletedJunk = 0;
+    let deletedDuplicates = 0;
+
+    const idsToDelete = [];
+
+    for (const item of allItems) {
+      if (isNonEnglish(item.title)) {
+        idsToDelete.push(item.id);
+        deletedNonEnglish++;
+      } else if (isJunkContent(item.title)) {
+        idsToDelete.push(item.id);
+        deletedJunk++;
+      }
+    }
+
+    // Delete duplicates (same title, keep lowest ID)
+    const [dupes] = await db.query(
+      `SELECT GROUP_CONCAT(id ORDER BY id ASC) as ids, title, COUNT(*) as cnt
+       FROM news_items WHERE tenant_id = ?
+       GROUP BY title HAVING cnt > 1`,
+      [tenantId]
+    );
+
+    for (const dupe of dupes) {
+      const ids = dupe.ids.split(',').map(Number);
+      // Keep the first (lowest ID), delete the rest
+      for (let i = 1; i < ids.length; i++) {
+        if (!idsToDelete.includes(ids[i])) {
+          idsToDelete.push(ids[i]);
+          deletedDuplicates++;
+        }
+      }
+    }
+
+    if (idsToDelete.length > 0) {
+      // Delete in chunks of 100
+      for (let i = 0; i < idsToDelete.length; i += 100) {
+        const chunk = idsToDelete.slice(i, i + 100);
+        const placeholders = chunk.map(() => '?').join(',');
+        await db.query(`DELETE FROM news_items WHERE id IN (${placeholders})`, chunk);
+      }
+    }
+
+    res.json({
+      deleted: idsToDelete.length,
+      non_english: deletedNonEnglish,
+      junk: deletedJunk,
+      duplicates: deletedDuplicates,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
